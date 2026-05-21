@@ -499,96 +499,204 @@ with tab3:
 # ╚═══════════════════════════════════════════════════╝
 with tab4:
     st.header("🤖 Управление на моделите")
-    st.info("""
-**Backtest** → тества точността на последните N месеца реални мачове  
-**Преобучаване** → тренира с новите данни от базата на Джеф  
-**Rollback** → връща предишната версия при лоши резултати
-    """)
 
-    # ── Backtest ─────────────────────────────────────
-    st.subheader("📊 Backtest")
+    # ─────────────────────────────────────────────────
+    # РАЗДЕЛ 1: BACKTEST
+    # ─────────────────────────────────────────────────
+    st.subheader("📊 Backtest — Колко точни са моделите?")
+
+    with st.expander("ℹ️ Как работи Backtest?", expanded=False):
+        st.markdown("""
+**Backtest** взима реални мачове, вече изиграни в последните N месеца, и проверява:
+> *"Ако бях използвал модела ПРЕДИ мача — колко пъти щях да позная победителя?"*
+
+**Стъпките:**
+1. Взима всички реални мачове от избрания период (от базата на Джеф)
+2. За всеки мач подава на модела данните от **преди** мача — Elo, форма, сервис %
+3. Проверява дали предикцията съвпада с реалния резултат
+4. **Точност ≥ 62%** → 🟢 Добра | **58–62%** → 🟡 Средна | **< 58%** → 🔴 Слаба
+
+**Защо Grass може да липсва:** Уимбълдън е юни-юли. Ако тестваш в май, буквално няма изиграни Grass мачове.
+        """)
+
     bt_months = st.slider("Период (месеци назад)", 1, 12, 6, key="t4_months")
 
-    if st.button("▶️ Стартирай Backtest", use_container_width=True):
-        with st.spinner("Тества... (1-2 минути)"):
-            results = backtest_models(MODELS, MODELS.get('bo3'), MASTER, STATS, months=bt_months)
+    if st.button("▶️ Стартирай Backtest", use_container_width=True, key="t4_bt_btn"):
+        with st.spinner("Тества моделите върху реални мачове... (1–2 мин)"):
+            bt_results = backtest_models(MODELS, MODELS.get('bo3'), MASTER, STATS, months=bt_months)
+        st.session_state['bt_results'] = bt_results
+        st.session_state['bt_months']  = bt_months
 
-        btr = []
+    if 'bt_results' in st.session_state:
+        bt  = st.session_state['bt_results']
+        mth = st.session_state['bt_months']
+        st.caption(f"Резултати за последните **{mth} месеца**")
+
         for surf in ['Hard', 'Clay', 'Grass']:
-            if surf in results:
-                r   = results[surf]
+            r = bt.get(surf)
+            if r is None:
+                st.info(f"**{surf}:** няма данни")
+            elif r.get('total', 0) == 0:
+                st.warning(f"**{surf}:** {r.get('error', 'Няма мачове')}")
+            else:
                 acc = r['accuracy']
                 ico = "🟢" if acc >= 0.62 else ("🟡" if acc >= 0.58 else "🔴")
-                lbl = "Добра" if acc >= 0.62 else ("Средна" if acc >= 0.58 else "Слаба")
-                btr.append({"Настилка": surf,
-                             "Точност": f"{acc:.1%}",
-                             "Верни / Общо": f"{r['correct']} / {r['total']}",
-                             "Оценка": f"{ico} {lbl}"})
-        if btr:
-            st.dataframe(pd.DataFrame(btr), hide_index=True, use_container_width=True)
+                skipped = r.get('skipped', 0)
+                note = f" *(прескочени: {skipped})*" if skipped else ""
+                st.metric(
+                    label=f"{ico} {surf}",
+                    value=f"{acc:.1%} точност",
+                    delta=f"{r['correct']} верни от {r['total']} мача{note}"
+                )
 
-        if 'BO3' in results:
-            mae = results['BO3']['mae']
+        if 'BO3' in bt:
+            mae = bt['BO3']['mae']
             ico = "🟢" if mae < 2.5 else ("🟡" if mae < 3.0 else "🔴")
-            st.metric("BO3 MAE", f"{mae:.2f} геймове",
-                      delta=f"{ico} {'Добър' if mae<2.5 else ('Среден' if mae<3.0 else 'Слаб')}")
-
-        bad = [s for s in ['Hard','Clay','Grass']
-               if s in results and results[s]['accuracy'] < 0.55]
-        if bad:
-            st.error(f"⚠️ Слаба точност при {', '.join(bad)} — препоръчително преобучаване!")
+            st.metric(
+                label=f"{ico} Геймове (BO3)",
+                value=f"MAE: {mae:.2f} геймове",
+                delta=f"Тестван на {bt['BO3']['total']} мача"
+            )
+            st.caption("MAE = средна грешка в брой геймове. **< 2.5** е добър резултат.")
 
     st.divider()
 
-    # ── Преобучаване ──────────────────────────────────
-    st.subheader("🔄 Преобучаване")
-    st.warning("Автоматично се запазва backup преди всяко преобучаване.")
+    # ─────────────────────────────────────────────────
+    # РАЗДЕЛ 2: ПРЕОБУЧАВАНЕ
+    # ─────────────────────────────────────────────────
+    st.subheader("🔄 Преобучаване — Обнови моделите с нови данни")
+
+    with st.expander("ℹ️ Как работи Преобучаването?", expanded=False):
+        st.markdown("""
+**Преобучаването** взима ВСИЧКИ налични данни от базата на Джеф (включително последната седмица) и тренира нов модел:
+
+1. Изтегля обновените данни от GitHub на Джеф Сакман (2018 → днес)
+2. Преизчислява Elo рейтинги, форма, сервис % за всички играчи
+3. Тренира нов Random Forest с разширения dataset
+4. **Автоматично запазва стария модел като backup** преди замяната
+5. Показва сравнение: стара точност ↔ нова точност
+
+**Кога да преобучаваш:** Веднъж седмично, или след голям турнир.
+        """)
 
     retrain_surfs = st.multiselect(
-        "Кои модели?",
+        "Кои модели да преобучим?",
         ["Hard", "Clay", "Grass", "BO3"],
-        default=["Hard", "Clay", "Grass", "BO3"]
+        default=["Hard", "Clay", "Grass", "BO3"],
+        key="t4_retrain_sel"
     )
 
-    if st.button("🚀 Преобучи", type="primary", use_container_width=True):
+    if st.button("🚀 Преобучи избраните модели", type="primary",
+                 use_container_width=True, key="t4_retrain_btn"):
+
         os.makedirs(BACKUP_DIR, exist_ok=True)
         bar = st.progress(0, text="Подготвя...")
+
+        # Запуска backtest ПРЕДИ преобучаването за сравнение
+        with st.spinner("Записва резултатите ПРЕДИ преобучаване..."):
+            before_bt = backtest_models(MODELS, MODELS.get('bo3'), MASTER, STATS, months=3)
+
+        comparison = {}
 
         for i, surf in enumerate(retrain_surfs):
             bar.progress(int(i / len(retrain_surfs) * 100), text=f"Преобучава {surf}...")
 
             if surf == "BO3":
                 src = f"{MODEL_DIR}/tennis_model_bo3_final.pkl"
-                if os.path.exists(src):
+                if os.path.exists(src) and MODELS.get('bo3'):
                     joblib.dump(MODELS['bo3'], f"{BACKUP_DIR}/tennis_model_bo3_final.pkl")
-                with st.spinner("BO3..."):
+                with st.spinner("Преобучава BO3..."):
                     new_bo3, mae = retrain_bo3_model(MASTER)
                 if new_bo3:
+                    old_mae = before_bt.get('BO3', {}).get('mae')
                     joblib.dump(new_bo3, src)
                     MODELS['bo3'] = new_bo3
-                    st.success(f"✅ BO3 — MAE: {mae:.2f}" if mae else "✅ BO3 преобучен")
+                    comparison['BO3'] = {'old_mae': old_mae, 'new_mae': mae}
+                else:
+                    st.warning("⚠️ BO3: недостатъчно данни")
             else:
                 src = f"{MODEL_DIR}/winner_model_{surf}.joblib"
                 if os.path.exists(src) and MODELS.get(surf):
                     joblib.dump(MODELS[surf], f"{BACKUP_DIR}/winner_model_{surf}.joblib")
-                with st.spinner(f"{surf}..."):
+                with st.spinner(f"Преобучава {surf}..."):
                     new_m = retrain_winner_model(MODELS[surf], surf, MASTER, STATS)
                 if new_m:
+                    old_acc = before_bt.get(surf, {}).get('accuracy')
                     joblib.dump(new_m, src)
                     MODELS[surf] = new_m
-                    st.success(f"✅ {surf} преобучен")
+                    comparison[surf] = {'old_acc': old_acc}
                 else:
                     st.warning(f"⚠️ {surf}: недостатъчно данни")
+
+        bar.progress(90, text="Финален тест след преобучаване...")
+        after_bt = backtest_models(MODELS, MODELS.get('bo3'), MASTER, STATS, months=3)
+
+        for surf in ['Hard', 'Clay', 'Grass']:
+            if surf in comparison:
+                comparison[surf]['new_acc'] = after_bt.get(surf, {}).get('accuracy')
+        if 'BO3' in comparison:
+            comparison['BO3']['new_mae'] = after_bt.get('BO3', {}).get('mae')
 
         bar.progress(100, text="Готово!")
         st.cache_resource.clear()
         st.balloons()
-        st.success("🎉 Готово! Backup е в `models/backup/`")
+
+        # ── Таблица: Стара vs Нова точност ────────────
+        st.success("🎉 Преобучаването приключи! Backup е запазен.")
+        st.subheader("📈 Сравнение: Преди vs След преобучаване")
+
+        comp_rows = []
+        for surf in ['Hard', 'Clay', 'Grass']:
+            if surf in comparison:
+                c     = comparison[surf]
+                old   = c.get('old_acc')
+                new   = c.get('new_acc')
+                delta = (new - old) if (old and new) else None
+                ico   = ("⬆️" if delta and delta > 0.005 else
+                         ("⬇️" if delta and delta < -0.005 else "➡️")) if delta is not None else "—"
+                comp_rows.append({
+                    "Модел":        surf,
+                    "Преди":        f"{old:.1%}" if old else "—",
+                    "След":         f"{new:.1%}" if new else "—",
+                    "Промяна":      f"{ico} {delta:+.1%}" if delta is not None else "—",
+                })
+
+        if 'BO3' in comparison:
+            c     = comparison['BO3']
+            old   = c.get('old_mae')
+            new   = c.get('new_mae')
+            delta = (new - old) if (old and new) else None
+            # За MAE: по-малко = по-добре, затова знаците са обърнати
+            ico   = ("⬆️ подобрение" if delta and delta < -0.1 else
+                     ("⬇️ влошаване" if delta and delta > 0.1 else "➡️ без промяна")) if delta else "—"
+            comp_rows.append({
+                "Модел":   "Геймове (MAE)",
+                "Преди":   f"{old:.2f}" if old else "—",
+                "След":    f"{new:.2f}" if new else "—",
+                "Промяна": ico,
+            })
+
+        if comp_rows:
+            st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
+
+        # Предупреждение ако новият модел е по-лош
+        bad = [r["Модел"] for r in comp_rows
+               if "⬇️" in str(r.get("Промяна", ""))]
+        if bad:
+            st.error(f"⚠️ Влошаване при: **{', '.join(bad)}** — обмисли Rollback!")
 
     st.divider()
 
-    # ── Rollback ──────────────────────────────────────
-    st.subheader("⏪ Rollback")
+    # ─────────────────────────────────────────────────
+    # РАЗДЕЛ 3: ROLLBACK
+    # ─────────────────────────────────────────────────
+    st.subheader("⏪ Rollback — Върни се към предишна версия")
+
+    with st.expander("ℹ️ Кога да ползвам Rollback?"):
+        st.markdown("""
+Ако след преобучаване точността се е **влошила значително** — rollback заменя новия модел
+с backup-а, запазен точно преди последното преобучаване.
+        """)
 
     avail_backup = []
     for surf in ['Hard', 'Clay', 'Grass']:
@@ -598,10 +706,13 @@ with tab4:
         avail_backup.append("BO3")
 
     if not avail_backup:
-        st.info("Няма backup. Създава се автоматично при следващото преобучаване.")
+        st.info("📦 Няма запазен backup. Той се създава автоматично при следващото преобучаване.")
     else:
-        rollback_sel = st.multiselect("Върни:", avail_backup, default=avail_backup)
-        if st.button("⏪ Rollback", type="secondary", use_container_width=True):
+        rollback_sel = st.multiselect(
+            "Избери модели за rollback:", avail_backup, default=avail_backup, key="t4_rollback_sel"
+        )
+        if st.button("⏪ Върни към backup", type="secondary",
+                     use_container_width=True, key="t4_rollback_btn"):
             import shutil
             for surf in rollback_sel:
                 if surf == "BO3":
@@ -610,22 +721,31 @@ with tab4:
                 else:
                     shutil.copy2(f"{BACKUP_DIR}/winner_model_{surf}.joblib",
                                  f"{MODEL_DIR}/winner_model_{surf}.joblib")
-                st.success(f"✅ {surf} върнат")
+                st.success(f"✅ {surf} върнат към backup версия")
             st.cache_resource.clear()
             time.sleep(1)
             st.rerun()
 
-    with st.expander("ℹ️ Текущи модели"):
+    st.divider()
+
+    # ─────────────────────────────────────────────────
+    # РАЗДЕЛ 4: ИНФО ЗА ТЕКУЩИТЕ МОДЕЛИ
+    # ─────────────────────────────────────────────────
+    with st.expander("🔬 Технически детайли за текущите модели"):
         for surf in ['Hard', 'Clay', 'Grass']:
             m = MODELS.get(surf)
             if m:
                 st.markdown(
-                    f"**{surf}:** RF | Trees `{m.n_estimators}` | "
-                    f"Depth `{m.max_depth}` | Features: `{list(m.feature_names_in_)}`"
+                    f"**{surf}:** RandomForest | "
+                    f"Дървета: `{m.n_estimators}` | "
+                    f"Дълбочина: `{m.max_depth}` | "
+                    f"Признаци: `{list(m.feature_names_in_)}`"
                 )
         if MODELS.get('bo3'):
             m = MODELS['bo3']
             st.markdown(
-                f"**BO3:** RF Regressor | Trees `{m.n_estimators}` | "
-                f"Depth `{m.max_depth}` | Features: `['rank_diff', 'w_roll_hold', 'l_roll_hold']`"
+                f"**BO3 (геймове):** RandomForest Regressor | "
+                f"Дървета: `{m.n_estimators}` | "
+                f"Дълбочина: `{m.max_depth}` | "
+                f"Признаци: `[rank_diff, w_roll_hold, l_roll_hold]`"
             )
